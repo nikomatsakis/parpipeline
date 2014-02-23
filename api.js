@@ -1,7 +1,7 @@
 var ParallelPipeline = (function() {
-  var { objectType, ArrayType, any, Object } = TypedObject;
+  var { objectType, ArrayType, any } = TypedObject;
 
-  function ParallelPipeline(input, depth) {
+  function fromArray(input, depth) {
     if (typeof depth === "undefined")
       depth = 1;
 
@@ -11,17 +11,27 @@ var ParallelPipeline = (function() {
     if (depth <= 0)
       throw new TypeError("Depth must be at least 1");
 
+    var typeObj = objectType(input);
     var shape;
-    if (depth == 1) {
-      shape = [input.length];
-    } else {
-      var inputShape = input.shape;
-      if (!inputShape || inputShape.length < depth)
+    if (typeObj === TypedObject.Object) {
+      if (depth !== 1)
         throw new TypeError("Depth too large");
-
+      shape = [input.length];
+      typeObj = any;
+    } else {
       shape = [];
-      for (var i = 0; i < depth; i++)
-        shape.push(inputShape[i]);
+
+      if (!(typeObj instanceof ArrayType))
+        throw new TypeError("Depth too large");
+      shape.push(input.length);
+      typeObj = typeObj.elementType;
+
+      for (var i = 1; i < depth; i++) {
+        if (!(typeObj instanceof ArrayType))
+          throw new TypeError("Depth too large");
+        shape.push(typeObj.length);
+        typeObj = typeObj.elementType;
+      }
     }
 
     assertEq(shape.length, depth);
@@ -32,55 +42,57 @@ var ParallelPipeline = (function() {
         throw new TypeError("Invalid shape");
     }
 
-    var typeObj = objectType(input);
-    if (typeObj === Object) {
-      if (depth !== 1)
-        throw new TypeError("Depth too large");
-      typeObj = any;
-    } else {
-      for (var i = 0; i < depth; i++)
-        typeObj = typeObj.elementType;
-    }
-
-    this.depth = depth;
-    this.op = new SupplyOp(input, typeObj, shape);
+    return new ArrayOp(input, typeObj, shape);
   }
 
-  ParallelPipeline.prototype = {
+  function BaseOp() { }
+  BaseOp.prototype = {
     map: function(func) {
-      return this.mapTo(this.op.grainType, func);
+      return this.mapTo(this.grainType, func);
     },
 
     mapTo: function(grainType, func) {
-      this.op = new MapToOp(this.op, grainType, func);
-      return this;
+      return new MapToOp(this, grainType, func);
     },
 
     filter: function(func) {
-      if (this.depth !== 1)
+      if (this.depth() !== 1)
         throw new TypeError("Cannot filter a pipeline unless depth is 1");
-      this.op = new FilterOp(this.op, func);
-      return this;
+      return new FilterOp(this, func);
     },
 
     build: function() {
-      return build(this.op.prepare());
+      return build(this.prepare_());
+    },
+
+    reduce: function(func) {
+      if (this.depth() !== 1)
+        throw new TypeError("Cannot reduce a pipeline unless depth is 1");
+      var temp = build(this.prepare_());
+      var accum = temp[0];
+      for (var i = 1; i < temp.length; i++)
+        accum = func(accum, temp[i]);
+      return accum;
     },
   };
 
   ///////////////////////////////////////////////////////////////////////////
 
-  function SupplyOp(input, grainType, shape) {
+  function ArrayOp(input, grainType, shape) {
     this.input = input;
     this.grainType = grainType;
     this.shape = shape;
   }
 
-  SupplyOp.prototype = {
-    prepare: function() {
+  ArrayOp.prototype = subtype(BaseOp.prototype, {
+    depth: function() {
+      return this.shape.length;
+    },
+
+    prepare_: function() {
       return new SupplyState(this);
     },
-  };
+  });
 
   function SupplyState(op) {
     this.op = op;
@@ -102,16 +114,21 @@ var ParallelPipeline = (function() {
   ///////////////////////////////////////////////////////////////////////////
 
   function MapToOp(prevOp, grainType, func) {
+    assertEq(prevOp instanceof BaseOp, true);
     this.prevOp = prevOp;
     this.grainType = grainType;
     this.func = func;
   }
 
-  MapToOp.prototype = {
-    prepare: function() {
-      return new MapState(this, this.prevOp.prepare());
+  MapToOp.prototype = subtype(BaseOp.prototype, {
+    depth: function() {
+      return this.prevOp.depth();
     },
-  };
+
+    prepare_: function() {
+      return new MapState(this, this.prevOp.prepare_());
+    },
+  });
 
   function MapState(op, prevState) {
     this.op = op;
@@ -135,9 +152,13 @@ var ParallelPipeline = (function() {
     this.func = func;
   }
 
-  FilterOp.prototype = {
-    prepare: function() {
-      var prevState = this.prevOp.prepare();
+  FilterOp.prototype = subtype(BaseOp.prototype, {
+    depth: function() {
+      return 1;
+    },
+
+    prepare_: function() {
+      var prevState = this.prevOp.prepare_();
       var grainType = prevState.grainType;
       var temp = build(prevState);
       var keeps = new Uint8Array(temp.length);
@@ -147,7 +168,7 @@ var ParallelPipeline = (function() {
           count++;
       return new FilterState(grainType, temp, keeps, count);
     }
-  };
+  });
 
   function FilterState(grainType, temp, keeps, count) {
     this.temp = temp;
@@ -219,20 +240,30 @@ var ParallelPipeline = (function() {
     return new arrayType();
   }
 
-  return ParallelPipeline;
+  function subtype(proto, props) {
+    var result = Object.create(proto);
+    for (var key in props) {
+      if (props.hasOwnProperty(key)) {
+        result[key] = props[key];
+      }
+    }
+    return result;
+  }
+
+  return { fromArray: fromArray };
 })();
 
 // Using it:
 
 function ParallelPipelineTests() {
-  var { uint32, objectType, ArrayType, any, Object } = TypedObject;
+  var { uint32, float64, objectType, ArrayType, any, Object } = TypedObject;
 
   function test1() {
     var uints = new ArrayType(uint32);
     var input =
       new uints([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     var output =
-      new ParallelPipeline(input).map(i => i + 1).map(i => i * 2).build();
+      ParallelPipeline.fromArray(input).map(i => i + 1).map(i => i * 2).build();
     assertEq(input.length, output.length);
     for (var i = 0; i < input.length; i++)
       assertEq((input[i] + 1) * 2, output[i]);
@@ -244,10 +275,36 @@ function ParallelPipelineTests() {
     var input =
       new uints([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     var output =
-      new ParallelPipeline(input).map(i => i + 1).filter(i => i > 5).build();
+      ParallelPipeline.fromArray(input).map(i => i + 1).filter(i => i > 5).build();
     assertArrayEq(output, [6, 7, 8, 9, 10, 11]);
   }
   test2();
+
+  function test3() {
+    var uints = uint32.array(5, 5);
+    var input =
+      new uints([[11, 12, 13, 14, 15],
+                 [21, 22, 23, 24, 25],
+                 [31, 32, 33, 34, 35],
+                 [41, 42, 43, 44, 45],
+                 [51, 52, 53, 54, 55]]);
+    var output =
+      ParallelPipeline.fromArray(input, 2).map(i => i + 1).build();
+    print(output.toSource());
+  }
+  test3();
+
+  function test4() {
+    var uints = new ArrayType(uint32);
+    var input =
+      new uints([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    var output =
+      ParallelPipeline.fromArray(input).
+      mapTo(float64, i => i + 0.22).
+      reduce((i, j) => i + j);
+    assertEq((output - 57.199) < 0.001, true);
+  }
+  test4();
 
   function assertArrayEq(array1, array2) {
     assertEq(array1.length, array2.length);
