@@ -1,5 +1,23 @@
 var ParallelPipeline = (function() {
-  var { objectType, ArrayType, any } = TypedObject;
+  var { objectType, ArrayType, Any } = TypedObject;
+
+  function fromFunc(shape0, func, grainType) {
+    var shape = [];
+    if ((shape0 | 0) === shape0)
+      shape.push(shape0 | 0);
+    else {
+      for (var i = 0; i < shape0.length; i++) {
+        if ((shape0[i] | 0) !== shape0[0])
+          throw new TypeError("Shape must be an array of ints");
+        shape.push(shape0[i] | 0);
+      }
+    }
+
+    if (typeof grainType === "undefined")
+      grainType = Any;
+
+    return new ComprehensionOp(func, grainType, shape);
+  }
 
   function fromArray(input, depth) {
     if (typeof depth === "undefined")
@@ -17,7 +35,7 @@ var ParallelPipeline = (function() {
       if (depth !== 1)
         throw new TypeError("Depth too large");
       shape = [input.length];
-      typeObj = any;
+      typeObj = Any;
     } else {
       shape = [];
 
@@ -42,7 +60,8 @@ var ParallelPipeline = (function() {
         throw new TypeError("Invalid shape");
     }
 
-    return new ArrayOp(input, typeObj, shape);
+    return new ComprehensionOp((...indices) => index(input, indices),
+                               typeObj, shape);
   }
 
   function BaseOp() { }
@@ -78,23 +97,23 @@ var ParallelPipeline = (function() {
 
   ///////////////////////////////////////////////////////////////////////////
 
-  function ArrayOp(input, grainType, shape) {
-    this.input = input;
+  function ComprehensionOp(func, grainType, shape) {
+    this.func = func;
     this.grainType = grainType;
     this.shape = shape;
   }
 
-  ArrayOp.prototype = subtype(BaseOp.prototype, {
+  ComprehensionOp.prototype = subtype(BaseOp.prototype, {
     depth: function() {
       return this.shape.length;
     },
 
     prepare_: function() {
-      return new SupplyState(this);
+      return new ComprehensionState(this);
     },
   });
 
-  function SupplyState(op) {
+  function ComprehensionState(op) {
     this.op = op;
     this.shape = this.op.shape;
     this.positions = [];
@@ -103,9 +122,9 @@ var ParallelPipeline = (function() {
     this.grainType = this.op.grainType;
   }
 
-  SupplyState.prototype = {
+  ComprehensionState.prototype = {
     next: function() {
-      var v = index(this.op.input, this.positions);
+      var v = this.op.func.apply(null, this.positions);
       increment(this.positions, this.shape);
       return v;
     },
@@ -250,13 +269,13 @@ var ParallelPipeline = (function() {
     return result;
   }
 
-  return { fromArray: fromArray };
+  return { fromArray: fromArray, fromFunc: fromFunc };
 })();
 
 // Using it:
 
 function ParallelPipelineTests() {
-  var { uint32, float64, objectType, ArrayType, any, Object } = TypedObject;
+  var { uint32, float64, objectType, ArrayType, Any, Object } = TypedObject;
 
   function test1() {
     var uints = new ArrayType(uint32);
@@ -299,12 +318,43 @@ function ParallelPipelineTests() {
     var input =
       new uints([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     var output =
-      ParallelPipeline.fromArray(input).
+      ParallelPipeline.
+      fromArray(input).
       mapTo(float64, i => i + 0.22).
       reduce((i, j) => i + j);
     assertEq((output - 57.199) < 0.001, true);
   }
   test4();
+
+  function test5() {
+    var output =
+      ParallelPipeline.
+      fromFunc(10, i => i + 1).
+      map(i => i + 1).
+      map(i => i * 2).
+      build();
+
+    var input = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assertEq(input.length, output.length);
+    for (var i = 0; i < input.length; i++)
+      assertEq((input[i] + 1) * 2, output[i]);
+  }
+  test5();
+
+  function test6() {
+    var output =
+      ParallelPipeline.
+      fromFunc(10, i => i + 1, uint32).
+      map(i => i + 1).
+      map(i => i * 2).
+      build();
+
+    var input = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assertEq(input.length, output.length);
+    for (var i = 0; i < input.length; i++)
+      assertEq((input[i] + 1) * 2, output[i]);
+  }
+  test5();
 
   function assertArrayEq(array1, array2) {
     assertEq(array1.length, array2.length);
